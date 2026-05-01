@@ -1,0 +1,461 @@
+PODROBNY OPIS PROJEKTU - GAMESTUDIO MIKROSERVISNA ARCHITEKTURA
+
+1. UVOD A HLAVNA MYSLIENKA PROJEKTU
+
+Projekt je navrhnuty ako backend platforma pre aplikaciu typu "GameStudio", kde
+uzivatelia mozu:
+- registrovat a spravovat uzivatelske konto,
+- prihlasovat sa cez JWT autentifikaciu,
+- pridavat a zobrazovat skore pre hry,
+- pridavat komentare ku hram,
+- hodnotit hry a zobrazovat priemerne hodnotenie.
+
+Hlavnym cielom projektu je oddelit klucove funkcionality do samostatnych mikrosluzieb.
+Tento pristup zjednodusuje dalsi vyvoj, testovanie aj nasadenie, pretoze kazda sluzba
+riesi iba jeden jasne definovany problem.
+
+Projekt je implementovany v jazyku Java pomocou Spring ekosystemu:
+- Spring Boot (zaklad aplikacii),
+- Spring Web (REST API),
+- Spring Cloud Gateway (API brana),
+- Spring Cloud Netflix Eureka (service discovery),
+- Spring Security + JWT (autentifikacia a autorizacia),
+- Spring Data JPA + PostgreSQL (perzistencia dat),
+- Redis (sprava refresh tokenov),
+- Resilience4j (retry, circuit breaker, time limiter),
+- Actuator + Prometheus endpointy pre monitoring.
+
+
+2. ARCHITEKTURA RIESENIA
+
+Projekt tvori 5 hlavnych mikrosluzieb:
+
+2.1 service-registry
+- Funkcia: centralny register sluzieb (Eureka server).
+- Port: 8761.
+- Vsetky ostatne sluzby sa sem registruju a cez tento register sa navzajom nachadzaju.
+- Vdaka tomu nie je nutne pevne konfiguracne viazat adresy mikrosluzieb.
+
+2.2 api-gateway
+- Funkcia: jednotny vstupny bod pre klienta.
+- Port: 9191.
+- Riesenie routovania:
+  - /api/users/** -> users-service
+  - /api/data/** -> data-service
+  - /api/auth/** -> auth-service
+- Brana vykonava:
+  - prepis ciest (RewritePath),
+  - validaciu JWT tokenu cez globalny filter,
+  - vytvorenie security contextu s rolou pouzivatela.
+- Obsahuje aj odolnostne mechanizmy (retry/circuit breaker/time limiter).
+
+2.3 auth-service
+- Funkcia: autentifikacia a token management.
+- Poskytuje endpointy:
+  - POST /api/v1/auth/login
+  - POST /api/v1/auth/refresh
+  - DELETE /api/v1/auth/logout
+- Po prihlaseni vytvori:
+  - access token (JWT, kratka expiracia),
+  - refresh token (ulozeny v Redis).
+- Pri refresh operacii overi refresh token a vyda novy access token.
+- Pri logout odstrani refresh token z uloziska.
+
+2.4 users-service
+- Funkcia: sprava uzivatelov.
+- Port: 8082.
+- Databaza: PostgreSQL (usersdb).
+- Podporuje CRUD operacie pre uzivatelov:
+  - vytvorenie uzivatela,
+  - nacitanie podla ID,
+  - nacitanie podla emailu,
+  - strankovany vypis pouzivatelov,
+  - zmazanie uzivatela.
+- API je navrhnute REST sposobom s korektnym vracanim HTTP kodov a location hlavicky.
+
+2.5 data-service
+- Funkcia: herne data (score, rating, comment).
+- Port: 8084.
+- Databaza: PostgreSQL (gamestudiodb).
+- Modul obsahuje tri samostatne casti:
+  1) ScoreController - skore hracov, top score podla hry, CRUD operacie.
+  2) RatingController - hodnotenia hier, priemerne hodnotenie, hladanie podla hry a hraca.
+  3) CommentController - komentare k hram, vypis podla hry, CRUD operacie.
+
+2.6 DETAIL - service-registry (Eureka server)
+- Uloha v architekture:
+  - Je to "telefonny zoznam" mikrosluzieb.
+  - Kazda sluzba sa pri starte registruje pod svojim nazvom (spring.application.name).
+  - Ostatne sluzby potom nemusia poznat IP/port ciela, staci nazov sluzby.
+- Konfiguracia a spravanie:
+  - Bezi na porte 8761.
+  - register-with-eureka=false a fetch-registry=false, pretoze je to server, nie klient.
+  - Poskytuje web UI pre kontrolu, ci su sluzby online.
+- Prakticky prinos:
+  - Pri restarte alebo zmene instancie nie je nutna zmena routingu.
+  - Umoznuje jednoduchsie horizontalne skalenie (viac instancii jednej sluzby).
+- Rizika a limity:
+  - Ak registry nie je dostupny, nove instancie sa neregistruju.
+  - V produkcii by bolo vhodne nasadit viac uzlov registry pre HA.
+
+2.7 DETAIL - api-gateway
+- Hlavna zodpovednost:
+  - Jednotny vstupny bod pre klienta (frontend, mobile app).
+  - Smeruje poziadavky podla URL prefixu na spravne mikrosluzby.
+- Routing logika:
+  - /api/users/** -> lb://users-service
+  - /api/data/** -> lb://data-service
+  - /api/auth/** -> lb://auth-service
+  - Cesta sa prepisuje filtrom RewritePath, aby interny endpoint ostal konzistentny.
+- Bezpecnost:
+  - JwtAuthFilter cita Authorization hlavicku.
+  - Overi platnost tokenu, extrahuje username a role.
+  - Vytvori Authentication objekt a vlozi ho do ReactiveSecurityContextHolder.
+  - Ak token chyba alebo je neplatny, request prejde bez autentifikacie (podla pravidiel endpointu).
+- Odolnost:
+  - Retry: opakovanie pri docasnej chybe.
+  - Circuit breaker: ochrana pred retazovym zlyhanim.
+  - Time limiter: maximalny cas cakania na odpoved.
+- Monitoring:
+  - Exponuje Prometheus endpoint.
+  - Umoznuje rychlo sledovat health a stav circuit breakerov.
+- Prakticky prinos:
+  - Centralizacia cross-cutting logiky (security, observability, odolnost).
+  - Jednoduchsie API pre klienta - klient nepozna vnutornu topologiu systemu.
+
+2.8 DETAIL - auth-service
+- Hlavna zodpovednost:
+  - Prihlasenie pouzivatela, vydavanie tokenov, obnova session.
+- Klucove endpointy:
+  - POST /api/v1/auth/login
+    Vstup: meno + heslo.
+    Vystup: access token + refresh token.
+  - POST /api/v1/auth/refresh
+    Vstup: refresh token.
+    Vystup: novy access token (refresh moze ostat ten isty).
+  - DELETE /api/v1/auth/logout
+    Vstup: refresh token.
+    Efekt: invalidacia refresh tokenu.
+- Interna logika login:
+  - AuthenticationManager overi prihlasovacie udaje.
+  - JwtService vygeneruje access token s rolou v claims.
+  - RefreshTokenService vytvori refresh token a ulozi ho do Redis.
+- Interna logika refresh:
+  - Overi kryptograficku validitu tokenu.
+  - Overi, ci token existuje v Redis (nie je revoked/expired).
+  - Vygeneruje novy access token.
+- Praca s Redis:
+  - Kluc refresh:<token> -> username.
+  - Kluc user_refresh:<username> -> mnozina tokenov pouzivatela.
+  - Pri create() sa stare tokeny uzivatela mazu (single-active-session pristup).
+- Bezpecnostny prinos:
+  - Access token je kratkodoby, minimalizuje dopad kompromitacie.
+  - Refresh token je kontrolovatelny (da sa odvolat), na rozdiel od cisto stateless modelu.
+- Slabsie miesta pre buduce zlepsenie:
+  - Secret je v kode/konfiguracii, v produkcii ma byt v secrets manageri.
+  - RuntimeException pri refresh by bolo vhodne nahradit vlastnymi exception typmi.
+
+2.9 DETAIL - users-service
+- Hlavna zodpovednost:
+  - Evidencia a sprava uzivatelskych profilov.
+- Datova vrstva:
+  - PostgreSQL databaza usersdb.
+  - JPA/Hibernate mapovanie entit.
+- Endpointy a spravanie:
+  - POST /api/v1/users/ - registracia noveho pouzivatela.
+    - Validuje vstup pomocou @Valid.
+    - Vracia 201 Created + Location hlavicku na novovytvoreny resource.
+  - GET /api/v1/users/{id} - nacitanie podla ID.
+  - GET /api/v1/users/by-email/{email} - nacitanie podla emailu.
+  - GET /api/v1/users/ - strankovany zoznam uzivatelov (Pageable + HATEOAS model).
+  - DELETE /api/v1/users/{id} - zmazanie uzivatela.
+- Integracia s auth-service:
+  - Auth-service pri niektorych operaciach nacitava info o uzivatelovi
+    (napr. rolu pre generovanie access tokenu).
+- Kvalitativne prvky:
+  - DTO vrstva oddeluje API kontrakt od entity modelu.
+  - REST konvencie a korektne HTTP statusy.
+- Rizika:
+  - Pri vysokom zatazeni treba zvazit indexy, cachovanie a read-replica pristup.
+  - V produkcii je vhodne oddelit citacie endpointy od zapisovych (CQRS light pristup).
+
+2.10 DETAIL - data-service
+- Hlavna zodpovednost:
+  - Uchovava a poskytuje herne interakcne data: score, ratings, comments.
+- Datova vrstva:
+  - PostgreSQL databaza gamestudiodb.
+  - Samostatne entity/repozitare pre score, rating, comment.
+- Modul SCORE:
+  - POST /api/v1/scores/ - vytvorenie skore.
+  - GET /api/v1/scores/{id} - detail skore.
+  - GET /api/v1/scores/top/{game} - top skore pre konkretnu hru.
+  - PUT /api/v1/scores/{id} - aktualizacia.
+  - DELETE /api/v1/scores/{id}, DELETE /api/v1/scores/ - mazanie.
+  - Biznis hodnota: leaderboard funkcionalita.
+- Modul RATING:
+  - POST /api/v1/ratings/ - ulozenie hodnotenia.
+  - GET /api/v1/ratings/avg/{game} - priemerne hodnotenie hry.
+  - GET /api/v1/ratings/by-player?game=...&player=... - hodnotenie hraca pre hru.
+  - Dolezite pre UX: rychla agregacia kvality hry pre klienta.
+- Modul COMMENT:
+  - POST /api/v1/comments/ - pridanie komentara.
+  - GET /api/v1/comments/by-game/{game} - diskusia ku hre.
+  - GET /api/v1/comments/{id}, GET /api/v1/comments/ - detail/list.
+  - DELETE endpointy pre moderaciu dat.
+- Kvalitativne prvky:
+  - Jednotna struktura controllerov (create/find/list/delete).
+  - DTO request/response objektovy model.
+  - Testy servisnej vrstvy (score/rating/comment) su pritomne.
+- Rizika a buduci rast:
+  - Pri vacsom objeme komentarov je vhodne pridat strankovanie aj pre comments.
+  - Pri leaderboardoch zvazit materializovane view alebo Redis cache.
+  - Pri ratings doplnit silnejsie pravidla proti duplicitnemu hlasovaniu.
+
+2.11 HLBOKY ROZPIS KAZDEHO SERVISU (CO ROBI, ZA CO ZODPOVEDA, FISKY, AKO FUNGUJE)
+
+A) SERVICE-REGISTRY
+- Co robi:
+  - Eviduje zoznam aktivnych mikrosluzieb a ich instancii.
+  - Umznuje dynamicke vyhladavanie sluzieb bez hardcoded adries.
+- Za co zodpoveda:
+  - Dostupnost metadata o sluzbach (nazov, host, port, heartbeat stav).
+  - Podporu load balancingu cez nazov sluzby (`lb://...`).
+- Fisky:
+  - Automaticka registracia/odregistracia pri starte a vypnuti sluzby.
+  - Self-preservation mechanizmus Eureky (ochrana pred agresivnym vyradovanim instancii).
+  - Centralny dashboard stavu sluzieb.
+- Ako funguje krok za krokom:
+  1) Mikrosluzba startuje a nacita `spring.application.name`.
+  2) Posle registraciu na Eureka server.
+  3) V pravidelnych intervaloch posiela heartbeat.
+  4) Gateway/klienti si vyziadaju zoznam dostupnych instancii podla mena sluzby.
+  5) Pri vypadku heartbeatu je instancia oznacena ako nedostupna.
+
+B) API-GATEWAY
+- Co robi:
+  - Prijima vsetky externe HTTP requesty a rozhoduje, kam ich poslat.
+  - Aplikuje jednotne pravidla bezpecnosti a odolnosti.
+- Za co zodpoveda:
+  - Routing, path rewrite, centralny vstupny bod API.
+  - Predspracovanie autentifikacie (JWT parse + validacia).
+  - Zber operacnych metrik.
+- Fisky:
+  - `RewritePath` oddeluje verejne API URL od internych URL sluzieb.
+  - `JwtAuthFilter` nastavi security context este pred vstupom do cielovej sluzby.
+  - Resilience4j retry/circuit breaker/time limiter pre stabilnejsie odpovede.
+  - Discovery locator vie dynamicky routovat aj bez manualnej route konfiguracie.
+- Ako funguje request:
+  1) Klient vola gateway endpoint (napr. `/api/data/...`).
+  2) Gateway najde pravidlo routingu.
+  3) Filter precita `Authorization` hlavicku.
+  4) Ak je token validny, do contextu sa ulozi user + rola.
+  5) Request sa preposle na vybranu instanciu cez `lb://service-name`.
+  6) V pripade chyby sa uplatni retry/circuit breaker podla konfiguracie.
+  7) Odpoved sa vrati klientovi ako keby islo o jeden backend.
+
+C) AUTH-SERVICE
+- Co robi:
+  - Overuje identitu uzivatela.
+  - Vydava a obnovuje tokeny.
+  - Invaliduje refresh tokeny pri logout.
+- Za co zodpoveda:
+  - Bezpecne prihlasenie.
+  - Session lifecycle (vytvorenie, refresh, ukoncenie).
+  - Prenos role do access token claims.
+- Fisky:
+  - Dvojtokenovy model: kratky access token + kontrolovatelny refresh token.
+  - Redis-backed refresh token storage (moznost revoke).
+  - `deleteAllUsers` strategia: pri novom login moze zostat iba aktivna aktualna session.
+- Ako funguje login:
+  1) Klient posle username/password.
+  2) `AuthenticationManager` overi credentials.
+  3) `JwtService` vytvori access token s role claim.
+  4) `RefreshTokenService` vytvori refresh token a ulozi ho do Redis s TTL.
+  5) Klient dostane `AuthResponse(access, refresh)`.
+- Ako funguje refresh:
+  1) Klient posle refresh token.
+  2) Service overi podpis/expiraciu JWT.
+  3) Service overi existenciu tokenu v Redis (server-side kontrola).
+  4) Vygeneruje novy access token.
+  5) Vrati novy access token bez nutnosti znovu zadat heslo.
+
+D) USERS-SERVICE
+- Co robi:
+  - Spravuje uzivatelske profily a ich atributy.
+  - Poskytuje read/write operacie nad uzivatelmi.
+- Za co zodpoveda:
+  - Jediny zdroj pravdy o uzivatelovi (id, email, rola, atd.).
+  - Validaciu vstupnych dat pri registracii.
+  - Paginovany listing pre admin alebo internu spotrebu.
+- Fisky:
+  - REST-konformna registracia s HTTP 201 + `Location` hlavickou.
+  - HATEOAS paged model pri vypise (`Pageable` + assembler).
+  - Dobre oddelenie vrstiev: controller/service/mapper/repository.
+- Ako funguje zapis a citanie:
+  1) Request ide na endpoint users-service.
+  2) Controller validuje DTO (`@Valid`).
+  3) Service riesi biznis pravidla a vola repository.
+  4) Entity sa ulozia cez JPA do PostgreSQL.
+  5) Odpoved sa mapuje na response DTO a vracia klientovi.
+- Spolupraca s auth-service:
+  - Auth-service vie nacitat user data (najma rolu), aby token reflektoval aktualne prava.
+
+E) DATA-SERVICE
+- Co robi:
+  - Obsluhuje domenove herne data: score, rating, comment.
+  - Poskytuje endpointy pre gameplay social feedback.
+- Za co zodpoveda:
+  - Leaderboard data (score).
+  - Kvalitativny signal hry (rating + average).
+  - Textovu spatnu vazbu komunity (comments).
+- Fisky:
+  - Tri logicky oddelene moduly v jednom servise (score/rating/comment).
+  - Agregacny endpoint `avg/{game}` pre rychle zobrazenie priemeru.
+  - Query endpoint `by-player` pre personalizovany pohlad na hodnotenie.
+  - Pripravena testovacia zakladna na service vrstve.
+- Ako funguje SCORE:
+  1) Hrac posle score event (hra, hrac, body, cas).
+  2) Service ulozi zaznam.
+  3) Pri `top/{game}` service vrati zoradeny vyber najlepsich vysledkov.
+- Ako funguje RATING:
+  1) Hrac posle hodnotenie hry.
+  2) Service ulozi alebo aktualizuje hodnotenie podla pravidiel.
+  3) Pri `avg/{game}` vrati agregovanu hodnotu pre UI.
+- Ako funguje COMMENT:
+  1) Hrac posle komentar ku hre.
+  2) Komentar sa ulozi s kontextom hry a autora.
+  3) `by-game/{game}` vracia vlakno diskusie pre konkretnu hru.
+- Prevadzkovy prinos:
+  - Tazsie read endpointy su oddelene od identity logiky.
+  - Lahsie sa skaluje nezavisle od auth/users casti.
+
+F) PRECO JE TAKETO ROZDELENIE SPRAVNE
+- Co riesi:
+  - Kazdy servis ma jednu domenu a jasne hranice zodpovednosti.
+- Co to dava timu:
+  - Nezavisly vyvoj a nasadzovanie.
+  - Lepsiu izolaciu poruch (pad data-service neblokuje login flow).
+  - Jasnu observabilitu: rychlo vidno, kde je bottleneck.
+- Fisky architektury:
+  - Lahsie pridanie noveho servisu (napr. notification-service).
+  - Moznost per-service skalenia podla realnej zataze.
+  - Cistejsia bezpecnostna strategia (gateway + auth ako centralna vrstva).
+
+
+3. TOK POZIADAVKY (END-TO-END SCENAR)
+
+Typicky scenar klienta:
+1) Klient posle registraciu do users-service cez API Gateway.
+2) Klient sa prihlasi cez auth-service endpoint /login.
+3) Auth-service overi meno/heslo cez AuthenticationManager.
+4) System vrati access + refresh token.
+5) Klient vola chranene endpointy (napr. data-service) s hlavickou Authorization: Bearer <token>.
+6) Gateway filter overi token, extrahuje username a rolu, ulozi ich do security contextu.
+7) Po expiracii access tokenu klient zavola /refresh a ziska novy access token.
+8) Pri logout sa refresh token invaliduje v Redis.
+
+Tento tok zabezpecuje:
+- centralizovanu bezpecnost,
+- oddelenie autentifikacie od domenovej logiky,
+- moznost horizontalneho skalenia jednotlivych sluzieb.
+
+
+4. BEZPECNOSTNY MODEL
+
+Projekt pouziva JWT model:
+- Access token je kratkodoby a prenasa rolu pouzivatela v claims.
+- Refresh token sluzi na obnovu session bez opakovaneho zadavania hesla.
+- Refresh tokeny su evidovane v Redis pod klucmi pre token aj pre pouzivatela.
+- Pri vytvoreni noveho refresh tokenu sa stare tokeny daneho uzivatela odstrania.
+
+Vyhody:
+- API zostava bezstavove pre bezne requesty (access token),
+- pritom je zachovana kontrola session cez Redis (refresh token),
+- jednoducha implementacia logout a revoke mechanizmu.
+
+
+5. POUZITE DATABAZY A UKLADANIE DAT
+
+5.1 PostgreSQL
+- users-service: tabulky a entity suvisiace s uzivatelmi.
+- data-service: tabulky pre score, rating a comment.
+- JPA/Hibernate pouzite na mapovanie entit.
+- Nastavenie `ddl-auto=update` umoznuje automaticke aktualizacie schemy pocas vyvoja.
+
+5.2 Redis
+- Pouzity v auth-service na refresh tokeny.
+- Uklada:
+  - mapovanie token -> username,
+  - mapovanie username -> mnozina tokenov.
+- Podporuje TTL (expiraciu tokenov) a rychle invalidacie.
+
+
+6. ODOLNOST A MONITORING
+
+V projekte su integrovane prve prvky produkcnej odolnosti:
+- Retry pri docasnych chybach komunikacie,
+- Circuit breaker na zabranenie kaskadovych zlyhani,
+- Time limiter na kontrolu casu odpovede.
+
+Monitoring:
+- Actuator endpointy pre health/info/metrics,
+- Expozicia Prometheus endpointu v API Gateway,
+- moznost napojenia na dalsie observability nastroje.
+
+
+7. NAVRH API A KVALITA IMPLEMENTACIE
+
+API je navrhnute konzistentne:
+- resource-oriented URL,
+- vhodne HTTP metody (GET, POST, PUT, DELETE),
+- navratove kody podla stavu operacie,
+- validacia vstupov (@Valid),
+- jasne oddelenie Controller -> Service -> Persistence vrstv.
+
+Dalsie prvky kvality:
+- pouzitie DTO objektov na oddelenie internych entit od API kontraktu,
+- paginacia v users-service,
+- testy servisnej vrstvy v data-service.
+
+
+8. CO JE HLAVNYM PRINOSOM PROJEKTU
+
+Najvacsi prinos projektu je v tom, ze ukazuje kompletny zaklad modernej
+mikrosluzbovej architektury pre realny use-case:
+- registracia a autentifikacia uzivatela,
+- decentralizovane domemove sluzby,
+- centralna API brana a service discovery,
+- kombinacia SQL databaz a Redis cache/token store,
+- pripravenost na dalsie skalenie a modularne rozsirovanie.
+
+Projekt je vhodny ako:
+- zaklad pre bakalarsku/diplomovu prezentaciu,
+- technologicky proof-of-concept,
+- startovaci backend pre plnohodnotnu webovu alebo mobilnu aplikaciu.
+
+
+9. MOZNE BUDUCE ROZSIRENIA
+
+Pre dalsi rozvoj je vhodne doplnit:
+1) centralizovanu konfiguraciu (Spring Cloud Config),
+2) distributed tracing (OpenTelemetry + Jaeger/Zipkin),
+3) role-based access policy na urovni endpointov,
+4) CI/CD pipeline a kontajnerizaciu (Docker, Kubernetes),
+5) rate limiting a API key ochranu v gateway,
+6) rozsirenie automatizovanych integrach testov.
+
+Tieto kroky by posunuli projekt z vyvojoveho prototypu blizsie k produkcnemu nasadeniu.
+
+
+10. ZAVER
+
+GameStudio backend je funkcny mikrosluzbovy system postaveny na Spring Cloud,
+ktory pokryva klucove oblasti:
+- identity a pristup,
+- spravu uzivatelov,
+- pracu s hernymi datami,
+- bezpecny a odolny pristup cez API Gateway.
+
+Architektura je modularna, dobre citatelna a pripravena na buduci rast.
+Projekt tak prakticky demonstruje, ako navrhnut a implementovat modernu cloud-native
+backend platformu v Java ekosysteme.
